@@ -367,7 +367,7 @@ def setup():
             "callback_query",
             "channel_post"
         ]
-    }))        )
+    })) 
     except Exception as e:
         print("ShrinkMe error:", e)
         return None
