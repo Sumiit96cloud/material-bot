@@ -1,118 +1,726 @@
 import os
 import time
+import json
 import secrets
 import threading
 import requests
-
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-# =========================================================
-# ENVIRONMENT VARIABLES
-# =========================================================
-
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-WEBHOOK_SECRET = os.environ["WEBHOOK_SECRET"]
-SETUP_KEY = os.environ["SETUP_KEY"]
-
+WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "change-this-secret")
+SETUP_KEY = os.environ.get("SETUP_KEY", "change-this-setup-key")
 CHANNEL_ID = int(os.environ["CHANNEL_ID"])
 SHRINKME_API = os.environ["SHRINKME_API"]
 
 BOT_USERNAME = "Matultra96Bot"
 
-# =========================================================
-# RAM LIMITS
-# =========================================================
+# -----------------------------
+# Persistent post-number mapping
+# -----------------------------
 
-MAX_THUMBNAILS = 300
-THUMBNAIL_TTL = 7 * 24 * 60 * 60
+DATA_FILE = "posts.json"
 
-TOKEN_TTL = 30 * 60
-
-VIDEO_DELETE_TIME = 24 * 60 * 60
-
-# message_id -> thumbnail file_id + timestamp
+POSTS = {}
+TOKENS = {}
 THUMBNAILS = {}
 
-# token -> access information
-TOKENS = {}
+TOKEN_TTL = 30 * 60
+VIDEO_DELETE_TIME = 24 * 60 * 60
+THUMBNAIL_TTL = 7 * 24 * 60 * 60
+MAX_THUMBNAILS = 300
+
+LOCK = threading.Lock()
 
 
-# =========================================================
-# TELEGRAM API
-# =========================================================
+def load_posts():
+    global POSTS
+
+    try:
+        with open(DATA_FILE, "r") as f:
+            POSTS = json.load(f)
+    except Exception:
+        POSTS = {}
+
+
+def save_posts():
+    temp_file = DATA_FILE + ".tmp"
+
+    with open(temp_file, "w") as f:
+        json.dump(POSTS, f)
+
+    os.replace(temp_file, DATA_FILE)
+
+
+load_posts()
+
+
+# -----------------------------
+# Telegram helpers
+# -----------------------------
 
 def telegram(method, data):
-
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
 
     try:
-
         response = requests.post(
             url,
             json=data,
             timeout=20
         )
-
         return response.json()
-
-    except Exception:
-
-        return {
-            "ok": False,
-            "description": "Telegram request failed"
-        }
+    except Exception as e:
+        print("Telegram error:", e)
+        return {"ok": False, "error": str(e)}
 
 
-# =========================================================
-# BASIC TELEGRAM FUNCTIONS
-# =========================================================
-
-def send_message(chat_id, text, keyboard=None):
-
+def send_message(chat_id, text, reply_markup=None):
     data = {
         "chat_id": chat_id,
         "text": text
     }
 
-    if keyboard:
+    if reply_markup:
+        data["reply_markup"] = reply_markup
 
-        data["reply_markup"] = {
-            "inline_keyboard": keyboard
-        }
-
-    return telegram(
-        "sendMessage",
-        data
-    )
+    return telegram("sendMessage", data)
 
 
-def send_photo(chat_id, photo, caption, keyboard=None):
-
+def send_photo(chat_id, photo, caption, reply_markup=None):
     data = {
         "chat_id": chat_id,
         "photo": photo,
         "caption": caption
     }
 
-    if keyboard:
+    if reply_markup:
+        data["reply_markup"] = reply_markup
 
-        data["reply_markup"] = {
-            "inline_keyboard": keyboard
-        }
-
-    return telegram(
-        "sendPhoto",
-        data
-    )
+    return telegram("sendPhoto", data)
 
 
 def answer_callback(callback_id):
-
     return telegram(
         "answerCallbackQuery",
         {
+            "callback_query_id": callback_id
+        }
+    )
+
+
+def delete_message(chat_id, message_id):
+    return telegram(
+        "deleteMessage",
+        {
+            "chat_id": chat_id,
+            "message_id": message_id
+        }
+    )
+
+
+# -----------------------------
+# Copy video from private channel
+# -----------------------------
+
+def copy_video(chat_id, source_message_id):
+
+    result = telegram(
+        "copyMessage",
+        {
+            "chat_id": chat_id,
+            "from_chat_id": CHANNEL_ID,
+            "message_id": source_message_id,
+            "caption": "🎬 Your requested video"
+        }
+    )
+
+    return result
+
+
+# -----------------------------
+# Auto delete after 24 hours
+# -----------------------------
+
+def schedule_video_delete(chat_id, message_id):
+
+    def worker():
+        time.sleep(VIDEO_DELETE_TIME)
+
+        try:
+            delete_message(chat_id, message_id)
+            print("Deleted:", chat_id, message_id)
+        except Exception as e:
+            print("Delete error:", e)
+
+    threading.Thread(
+        target=worker,
+        daemon=True
+    ).start()
+
+
+# -----------------------------
+# ShrinkMe
+# -----------------------------
+
+def create_shrink_link(destination):
+
+    try:
+        response = requests.get(
+            "https://shrinkme.io/api",
+            params={
+                "api": SHRINKME_API,
+                "url": destination
+            },
+            timeout=20
+        )
+
+        data = response.json()
+
+        print("ShrinkMe:", data)
+
+        short_url = (
+            data.get("shortenedUrl")
+            or data.get("shortenedURL")
+            or data.get("shorturl")
+            or data.get("short")
+        )
+
+        return short_url
+
+    except Exception as e:
+        print("ShrinkMe error:", e)
+        return None
+
+
+# -----------------------------
+# Memory cleanup
+# -----------------------------
+
+def cleanup_memory():
+
+    while True:
+
+        time.sleep(600)
+
+        now = time.time()
+
+        # Remove expired tokens
+        with LOCK:
+            expired_tokens = [
+                token
+                for token, data in TOKENS.items()
+                if data["expires"] < now
+            ]
+
+            for token in expired_tokens:
+                del TOKENS[token]
+
+            # Remove old thumbnails
+            expired_thumbs = [
+                post_no
+                for post_no, data in THUMBNAILS.items()
+                if data["time"] + THUMBNAIL_TTL < now
+            ]
+
+            for post_no in expired_thumbs:
+                del THUMBNAILS[post_no]
+
+            # Keep only latest thumbnails
+            if len(THUMBNAILS) > MAX_THUMBNAILS:
+
+                sorted_items = sorted(
+                    THUMBNAILS.items(),
+                    key=lambda x: x[1]["time"]
+                )
+
+                remove_count = len(THUMBNAILS) - MAX_THUMBNAILS
+
+                for post_no, _ in sorted_items[:remove_count]:
+                    del THUMBNAILS[post_no]
+
+        print("Memory cleanup completed.")
+
+
+threading.Thread(
+    target=cleanup_memory,
+    daemon=True
+).start()
+
+
+# -----------------------------
+# Home
+# -----------------------------
+
+@app.route("/")
+def home():
+    return "Bot is running!"
+
+
+# -----------------------------
+# Webhook
+# -----------------------------
+
+@app.route("/telegram/webhook", methods=["POST"])
+def webhook():
+
+    # Security check
+    if request.headers.get(
+        "X-Telegram-Bot-Api-Secret-Token"
+    ) != WEBHOOK_SECRET:
+
+        return "Forbidden", 403
+
+    data = request.get_json(silent=True) or {}
+
+    # ---------------------------------
+    # CHANNEL POST
+    # ---------------------------------
+
+    if "channel_post" in data:
+
+        channel_post = data["channel_post"]
+
+        chat = channel_post.get("chat", {})
+        channel_id = chat.get("id")
+
+        if channel_id != CHANNEL_ID:
+            return "OK", 200
+
+        # Only process videos
+        video = channel_post.get("video")
+
+        if not video:
+            return "OK", 200
+
+        telegram_message_id = channel_post.get("message_id")
+
+        # Find next sequence number
+        with LOCK:
+
+            if POSTS:
+                numbers = [
+                    int(x)
+                    for x in POSTS.keys()
+                    if str(x).isdigit()
+                ]
+
+                next_number = max(numbers) + 1 if numbers else 1
+
+            else:
+                next_number = 1
+
+            POSTS[str(next_number)] = telegram_message_id
+
+            save_posts()
+
+        # Save thumbnail if available
+        thumbnail = (
+            video.get("thumbnail")
+            or video.get("thumb")
+        )
+
+        if thumbnail:
+
+            THUMBNAILS[str(next_number)] = {
+                "file_id": thumbnail["file_id"],
+                "time": time.time()
+            }
+
+        # Tell admin/channel where sequence reached
+        print(
+            f"NEW VIDEO → Post No. {next_number} "
+            f"→ Telegram ID {telegram_message_id}"
+        )
+
+        return "OK", 200
+
+
+    # ---------------------------------
+    # NORMAL MESSAGE
+    # ---------------------------------
+
+    message = data.get("message")
+
+    if message:
+
+        chat = message.get("chat", {})
+        chat_id = chat.get("id")
+        text = message.get("text", "")
+
+        if not chat_id:
+            return "OK", 200
+
+        # /start
+        if text.startswith("/start"):
+
+            parts = text.split(maxsplit=1)
+
+            # Normal start
+            if len(parts) == 1:
+
+                keyboard = {
+                    "inline_keyboard": [
+                        [
+                            {
+                                "text": "🎬 New Video",
+                                "callback_data": "new"
+                            }
+                        ],
+                        [
+                            {
+                                "text": "ℹ️ Help",
+                                "callback_data": "help"
+                            }
+                        ]
+                    ]
+                }
+
+                send_message(
+                    chat_id,
+                    "👋 Welcome!\n\n"
+                    "Send the Post No. to get your video.\n\n"
+                    "Example: 25",
+                    keyboard
+                )
+
+                return "OK", 200
+
+            # Return from ShrinkMe
+            token = parts[1].strip()
+
+            with LOCK:
+                token_data = TOKENS.get(token)
+
+            if not token_data:
+                send_message(
+                    chat_id,
+                    "❌ Invalid or expired link.\n\n"
+                    "Please request the video again."
+                )
+
+                return "OK", 200
+
+            if token_data["expires"] < time.time():
+
+                with LOCK:
+                    TOKENS.pop(token, None)
+
+                send_message(
+                    chat_id,
+                    "❌ This link has expired.\n\n"
+                    "Please request the video again."
+                )
+
+                return "OK", 200
+
+            if token_data["chat_id"] != chat_id:
+
+                send_message(
+                    chat_id,
+                    "❌ This link belongs to another user."
+                )
+
+                return "OK", 200
+
+            source_message_id = token_data["source_message_id"]
+
+            with LOCK:
+                TOKENS.pop(token, None)
+
+            result = copy_video(
+                chat_id,
+                source_message_id
+            )
+
+            if not result.get("ok"):
+
+                send_message(
+                    chat_id,
+                    "❌ Video could not be sent.\n\n"
+                    "Please try again."
+                )
+
+                return "OK", 200
+
+            copied_message = result.get("result", {})
+            copied_message_id = copied_message.get("message_id")
+
+            if copied_message_id:
+                schedule_video_delete(
+                    chat_id,
+                    copied_message_id
+                )
+
+            keyboard = {
+                "inline_keyboard": [
+                    [
+                        {
+                            "text": "🎬 New Video",
+                            "callback_data": "new"
+                        }
+                    ],
+                    [
+                        {
+                            "text": "🔄 Again",
+                            "callback_data": "again"
+                        }
+                    ]
+                ]
+            }
+
+            send_message(
+                chat_id,
+                "✅ Video sent!\n\n"
+                "It will automatically disappear after 24 hours.",
+                keyboard
+            )
+
+            return "OK", 200
+
+
+        # /help
+        if text.startswith("/help"):
+
+            send_message(
+                chat_id,
+                "📖 How to use:\n\n"
+                "Send the Post No. of the video.\n"
+                "Example: 1\n\n"
+                "You will receive a link first."
+            )
+
+            return "OK", 200
+
+
+        # ---------------------------------
+        # POST NUMBER
+        # ---------------------------------
+
+        if text.isdigit():
+
+            post_number = text.strip()
+
+            with LOCK:
+                source_message_id = POSTS.get(post_number)
+
+            if not source_message_id:
+
+                send_message(
+                    chat_id,
+                    "❌ Post No. not found."
+                )
+
+                return "OK", 200
+
+            keyboard = {
+                "inline_keyboard": [
+                    [
+                        {
+                            "text": "🔓 Get Video",
+                            "callback_data": f"get_{post_number}"
+                        }
+                    ]
+                ]
+            }
+
+            thumbnail_data = THUMBNAILS.get(post_number)
+
+            if thumbnail_data:
+
+                result = send_photo(
+                    chat_id,
+                    thumbnail_data["file_id"],
+                    f"🎬 Post No. {post_number}",
+                    keyboard
+                )
+
+                # Fallback if thumbnail fails
+                if not result.get("ok"):
+
+                    send_message(
+                        chat_id,
+                        f"🎬 Post No. {post_number}\n\n"
+                        "Your video is ready.",
+                        keyboard
+                    )
+
+            else:
+
+                send_message(
+                    chat_id,
+                    f"🎬 Post No. {post_number}\n\n"
+                    "Your video is ready.",
+                    keyboard
+                )
+
+            return "OK", 200
+
+
+    # ---------------------------------
+    # CALLBACK QUERY
+    # ---------------------------------
+
+    callback = data.get("callback_query")
+
+    if callback:
+
+        callback_id = callback.get("id")
+        callback_data = callback.get("data")
+
+        callback_message = callback.get("message", {})
+        chat = callback_message.get("chat", {})
+        chat_id = chat.get("id")
+
+        answer_callback(callback_id)
+
+        # Get video
+        if callback_data.startswith("get_"):
+
+            post_number = callback_data.replace(
+                "get_",
+                "",
+                1
+            )
+
+            with LOCK:
+                source_message_id = POSTS.get(post_number)
+
+            if not source_message_id:
+
+                send_message(
+                    chat_id,
+                    "❌ Post No. not found."
+                )
+
+                return "OK", 200
+
+            # Create fresh token
+            token = secrets.token_urlsafe(18)
+
+            with LOCK:
+                TOKENS[token] = {
+                    "chat_id": chat_id,
+                    "source_message_id": source_message_id,
+                    "expires": time.time() + TOKEN_TTL
+                }
+
+            destination = (
+                f"https://t.me/{BOT_USERNAME}"
+                f"?start={token}"
+            )
+
+            short_url = create_shrink_link(
+                destination
+            )
+
+            if not short_url:
+
+                with LOCK:
+                    TOKENS.pop(token, None)
+
+                send_message(
+                    chat_id,
+                    "❌ Link service is temporarily unavailable.\n"
+                    "Please try again later."
+                )
+
+                return "OK", 200
+
+            keyboard = {
+                "inline_keyboard": [
+                    [
+                        {
+                            "text": "🔗 Open Link",
+                            "url": short_url
+                        }
+                    ]
+                ]
+            }
+
+            send_message(
+                chat_id,
+                "🔐 Complete the link process first.\n\n"
+                "Then Telegram will automatically return you "
+                "to the bot and your video will be sent.",
+                keyboard
+            )
+
+            return "OK", 200
+
+
+        # New Video
+        if callback_data == "new":
+
+            send_message(
+                chat_id,
+                "🎬 Send the Post No.\n\n"
+                "Example: 25"
+            )
+
+            return "OK", 200
+
+
+        # Again
+        if callback_data == "again":
+
+            send_message(
+                chat_id,
+                "🔄 Send the Post No. again."
+            )
+
+            return "OK", 200
+
+
+        # Help
+        if callback_data == "help":
+
+            send_message(
+                chat_id,
+                "📖 How to use:\n\n"
+                "1. Send the Post No.\n"
+                "2. Press Get Video.\n"
+                "3. Open the link.\n"
+                "4. You will return to the bot.\n"
+                "5. The video will be sent automatically."
+            )
+
+            return "OK", 200
+
+    return "OK", 200
+
+
+# -----------------------------
+# Setup webhook
+# -----------------------------
+
+@app.route("/setup")
+def setup():
+
+    key = request.args.get("key")
+
+    if key != SETUP_KEY:
+        return "Forbidden", 403
+
+    webhook_url = (
+        request.url_root.rstrip("/")
+        + "/telegram/webhook"
+    )
+
+    result = telegram(
+        "setWebhook",
+        {
+            "url": webhook_url,
+            "secret_token": WEBHOOK_SECRET,
+            "allowed_updates": [
+                "message",
+                "callback_query",
+                "channel_post"
+            ]
+        }
+    )
+
+    return jsonify(result)        {
             "callback_query_id": callback_id
         }
     )
