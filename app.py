@@ -1,118 +1,355 @@
-import json
-import os
-import secrets
-import threading
-import time
-import requests
+import os, time, json, secrets, threading, requests
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-# Configuration & Environment Variables
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
-SETUP_KEY = os.environ.get("SETUP_KEY", "")
-CHANNEL_ID = os.environ.get("CHANNEL_ID", "")
-SHRINKME_API = os.environ.get("SHRINKME_API", "")
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "change-this-secret")
+SETUP_KEY = os.environ.get("SETUP_KEY", "change-this-setup-key")
+CHANNEL_ID = int(os.environ["CHANNEL_ID"])
+SHRINKME_API = os.environ["SHRINKME_API"]
 BOT_USERNAME = "Matultra96Bot"
 
-TELEGRAM_API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
-POSTS_FILE = "posts.json"
+DATA_FILE = "posts.json"
+POSTS, TOKENS, THUMBNAILS = {}, {}, {}
+LOCK = threading.Lock()
+TOKEN_TTL = 30 * 60
+DELETE_AFTER = 24 * 60 * 60
+THUMBNAIL_TTL = 7 * 24 * 60 * 60
+MAX_THUMBNAILS = 300
 
-# In-Memory Storage & Thread Safety
-posts_lock = threading.Lock()
-ram_lock = threading.Lock()
 
-# Persistent state mapping: post_num (int) -> message_id (int)
-posts_data = {
-    "next_post_num": 1,
-    "mapping": {}
-}
-
-# RAM caches
-# tokens: token -> {"chat_id": int, "message_id": int, "expires_at": float}
-tokens = {}
-
-# thumbnails: post_num (str/int) -> {"file_id": str, "timestamp": float}
-thumbnails = {}
-
-# scheduled_deletions: list of {"chat_id": int, "message_id": int, "delete_at": float}
-scheduled_deletions = []
-
-# Persistent Storage Helpers
 def load_posts():
-    global posts_data
-    with posts_lock:
-        if os.path.exists(POSTS_FILE):
-            try:
-                with open(POSTS_FILE, "r") as f:
-                    posts_data = json.load(f)
-                    # Convert mapping keys back to int if needed
-                    posts_data["mapping"] = {int(k): int(v) for k, v in posts_data.get("mapping", {}).items()}
-                    if "next_post_num" not in posts_data:
-                        posts_data["next_post_num"] = max(posts_data["mapping"].keys(), default=0) + 1
-            except Exception as e:
-                print(f"Error loading {POSTS_FILE}: {e}")
+    global POSTS
+    try:
+        with open(DATA_FILE, "r", encoding="utf-8") as f:
+            POSTS = json.load(f)
+    except Exception:
+        POSTS = {}
+
 
 def save_posts():
-    with posts_lock:
-        try:
-            with open(POSTS_FILE, "w") as f:
-                json.dump(posts_data, f)
-        except Exception as e:
-            print(f"Error saving {POSTS_FILE}: {e}")
+    tmp = DATA_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(POSTS, f)
+    os.replace(tmp, DATA_FILE)
 
-load_posts()
 
-# Telegram API Wrapper Helper
-def call_telegram(method, payload):
+def telegram(method, data):
     try:
-        url = f"{TELEGRAM_API_URL}/{method}"
-        resp = requests.post(url, json=payload, timeout=10)
-        return resp.json()
+        r = requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/{method}",
+            json=data, timeout=20
+        )
+        return r.json()
     except Exception as e:
-        print(f"Telegram API request failed ({method}): {e}")
+        print("Telegram error:", e)
+        return {"ok": False}
+
+
+def send_message(chat_id, text, keyboard=None):
+    data = {"chat_id": chat_id, "text": text}
+    if keyboard:
+        data["reply_markup"] = keyboard
+    return telegram("sendMessage", data)
+
+
+def send_photo(chat_id, photo, caption, keyboard=None):
+    data = {"chat_id": chat_id, "photo": photo, "caption": caption}
+    if keyboard:
+        data["reply_markup"] = keyboard
+    return telegram("sendPhoto", data)
+
+
+def copy_video(chat_id, message_id):
+    return telegram("copyMessage", {
+        "chat_id": chat_id,
+        "from_chat_id": CHANNEL_ID,
+        "message_id": message_id,
+        "caption": "🎬 Your requested video"
+    })
+
+
+def delete_message(chat_id, message_id):
+    return telegram("deleteMessage", {
+        "chat_id": chat_id, "message_id": message_id
+    })
+
+
+def delete_later(chat_id, message_id):
+    def worker():
+        time.sleep(DELETE_AFTER)
+        delete_message(chat_id, message_id)
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def make_shrink_link(destination):
+    try:
+        r = requests.get(
+            "https://shrinkme.io/api",
+            params={"api": SHRINKME_API, "url": destination},
+            timeout=20
+        )
+        data = r.json()
+        print("ShrinkMe:", data)
+        return (
+            data.get("shortenedUrl")
+            or data.get("shortenedURL")
+            or data.get("shorturl")
+            or data.get("short")
+        )
+    except Exception as e:
+        print("ShrinkMe error:", e)
         return None
 
-# Background Daemon Tasks
-def ram_cleanup_loop():
+
+def cleanup():
     while True:
-        time.sleep(600)  # Runs every 10 minutes
+        time.sleep(600)
         now = time.time()
-        with ram_lock:
-            # Clean expired tokens (> 30 min)
-            expired_tokens = [t for t, data in tokens.items() if data.get("expires_at", 0) < now]
-            for t in expired_tokens:
-                del tokens[t]
+        with LOCK:
+            for t in list(TOKENS):
+                if TOKENS[t]["expires"] < now:
+                    del TOKENS[t]
+            for n in list(THUMBNAILS):
+                if THUMBNAILS[n]["time"] + THUMBNAIL_TTL < now:
+                    del THUMBNAILS[n]
+            if len(THUMBNAILS) > MAX_THUMBNAILS:
+                items = sorted(
+                    THUMBNAILS.items(),
+                    key=lambda x: x[1]["time"]
+                )
+                for n, _ in items[:-MAX_THUMBNAILS]:
+                    del THUMBNAILS[n]
 
-            # Clean expired thumbnails (> 7 days)
-            seven_days_sec = 7 * 24 * 3600
-            expired_thumbs = [p for p, data in thumbnails.items() if now - data.get("timestamp", 0) > seven_days_sec]
-            for p in expired_thumbs:
-                del thumbnails[p]
 
-            # Enforce max 300 thumbnails
-            if len(thumbnails) > 300:
-                sorted_thumbs = sorted(thumbnails.items(), key=lambda x: x[1].get("timestamp", 0))
-                to_remove = len(thumbnails) - 300
-                for i in range(to_remove):
-                    del thumbnails[sorted_thumbs[i][0]]
+load_posts()
+threading.Thread(target=cleanup, daemon=True).start()
 
-def message_deletion_loop():
-    while True:
-        time.sleep(10)
-        now = time.time()
-        with ram_lock:
-            to_delete = [item for item in scheduled_deletions if item["delete_at"] <= now]
-            for item in to_delete:
-                scheduled_deletions.remove(item)
-                call_telegram("deleteMessage", {
-                    "chat_id": item["chat_id"],
-                    "message_id": item["message_id"]
-                })
 
-# Start background threads
-t_cleanup = threading.Thread(target=ram_cleanup_loop, daemon=True)
+@app.route("/")
+def home():
+    return "Bot is running!"
+
+
+@app.route("/telegram/webhook", methods=["POST"])
+def webhook():
+    if request.headers.get("X-Telegram-Bot-Api-Secret-Token") != WEBHOOK_SECRET:
+        return "Forbidden", 403
+
+    data = request.get_json(silent=True) or {}
+
+    # Automatically number every new video in the private channel.
+    channel_post = data.get("channel_post")
+    if channel_post:
+        chat_id = channel_post.get("chat", {}).get("id")
+        if chat_id != CHANNEL_ID:
+            return "OK", 200
+
+        video = channel_post.get("video")
+        if not video:
+            return "OK", 200
+
+        message_id = channel_post.get("message_id")
+
+        with LOCK:
+            nums = [int(x) for x in POSTS if str(x).isdigit()]
+            number = max(nums) + 1 if nums else 1
+            POSTS[str(number)] = message_id
+            save_posts()
+
+        thumb = video.get("thumbnail") or video.get("thumb")
+        if thumb:
+            THUMBNAILS[str(number)] = {
+                "file_id": thumb["file_id"],
+                "time": time.time()
+            }
+
+        # This message appears in the private source channel.
+        send_message(CHANNEL_ID, f"✅ Post No. {number}")
+        print(f"NEW VIDEO -> Post No. {number} -> Telegram ID {message_id}")
+        return "OK", 200
+
+    message = data.get("message")
+    if message:
+        chat_id = message.get("chat", {}).get("id")
+        text = message.get("text", "")
+        if not chat_id:
+            return "OK", 200
+
+        if text.startswith("/start"):
+            parts = text.split(maxsplit=1)
+
+            if len(parts) == 1:
+                keyboard = {
+                    "inline_keyboard": [
+                        [{"text": "🎬 New Video", "callback_data": "new"}],
+                        [{"text": "ℹ️ Help", "callback_data": "help"}]
+                    ]
+                }
+                send_message(
+                    chat_id,
+                    "👋 Welcome!\n\nSend the Post No. to get your video.\nExample: 1",
+                    keyboard
+                )
+                return "OK", 200
+
+            token = parts[1].strip()
+            with LOCK:
+                td = TOKENS.get(token)
+
+            if not td or td["expires"] < time.time():
+                with LOCK:
+                    TOKENS.pop(token, None)
+                send_message(chat_id, "❌ Invalid or expired link.")
+                return "OK", 200
+
+            if td["chat_id"] != chat_id:
+                send_message(chat_id, "❌ This link belongs to another user.")
+                return "OK", 200
+
+            with LOCK:
+                TOKENS.pop(token, None)
+
+            result = copy_video(chat_id, td["source_message_id"])
+            if not result.get("ok"):
+                send_message(chat_id, "❌ Video could not be sent.")
+                return "OK", 200
+
+            copied_id = result.get("result", {}).get("message_id")
+            if copied_id:
+                delete_later(chat_id, copied_id)
+
+            keyboard = {
+                "inline_keyboard": [
+                    [{"text": "🎬 New Video", "callback_data": "new"}],
+                    [{"text": "🔄 Again", "callback_data": "again"}]
+                ]
+            }
+            send_message(
+                chat_id,
+                "✅ Video sent!\n\nIt will automatically disappear after 24 hours.",
+                keyboard
+            )
+            return "OK", 200
+
+        if text.startswith("/help"):
+            send_message(
+                chat_id,
+                "📖 Send the Post No., press Get Video, then open the link."
+            )
+            return "OK", 200
+
+        if text.isdigit():
+            number = text.strip()
+            with LOCK:
+                message_id = POSTS.get(number)
+
+            if not message_id:
+                send_message(chat_id, "❌ Post No. not found.")
+                return "OK", 200
+
+            keyboard = {
+                "inline_keyboard": [
+                    [{"text": "🔓 Get Video", "callback_data": f"get_{number}"}]
+                ]
+            }
+            thumb = THUMBNAILS.get(number)
+
+            if thumb:
+                result = send_photo(
+                    chat_id, thumb["file_id"],
+                    f"🎬 Post No. {number}", keyboard
+                )
+                if not result.get("ok"):
+                    send_message(
+                        chat_id,
+                        f"🎬 Post No. {number}\n\nYour video is ready.",
+                        keyboard
+                    )
+            else:
+                send_message(
+                    chat_id,
+                    f"🎬 Post No. {number}\n\nYour video is ready.",
+                    keyboard
+                )
+            return "OK", 200
+
+    callback = data.get("callback_query")
+    if callback:
+        callback_id = callback.get("id")
+        action = callback.get("data", "")
+        chat_id = callback.get("message", {}).get("chat", {}).get("id")
+        telegram("answerCallbackQuery", {"callback_query_id": callback_id})
+
+        if action.startswith("get_"):
+            number = action[4:]
+            with LOCK:
+                message_id = POSTS.get(number)
+
+            if not message_id:
+                send_message(chat_id, "❌ Post No. not found.")
+                return "OK", 200
+
+            token = secrets.token_urlsafe(18)
+            with LOCK:
+                TOKENS[token] = {
+                    "chat_id": chat_id,
+                    "source_message_id": message_id,
+                    "expires": time.time() + TOKEN_TTL
+                }
+
+            destination = f"https://t.me/{BOT_USERNAME}?start={token}"
+            short_url = make_shrink_link(destination)
+
+            if not short_url:
+                with LOCK:
+                    TOKENS.pop(token, None)
+                send_message(chat_id, "❌ Link service is temporarily unavailable.")
+                return "OK", 200
+
+            keyboard = {
+                "inline_keyboard": [
+                    [{"text": "🔗 Open Link", "url": short_url}]
+                ]
+            }
+            send_message(
+                chat_id,
+                "🔐 Open the link first. After the link process, you will return to the bot.",
+                keyboard
+            )
+            return "OK", 200
+
+        if action == "new":
+            send_message(chat_id, "🎬 Send the Post No.\n\nExample: 25")
+            return "OK", 200
+
+        if action == "again":
+            send_message(chat_id, "🔄 Send the Post No. again.")
+            return "OK", 200
+
+        if action == "help":
+            send_message(
+                chat_id,
+                "📖 Send the Post No. → Get Video → Open Link → Return to Telegram."
+            )
+            return "OK", 200
+
+    return "OK", 200
+
+
+@app.route("/setup")
+def setup():
+    if request.args.get("key") != SETUP_KEY:
+        return "Forbidden", 403
+
+    webhook_url = request.url_root.rstrip("/") + "/telegram/webhook"
+    result = telegram("setWebhook", {
+        "url": webhook_url,
+        "secret_token": WEBHOOK_SECRET,
+        "allowed_updates": ["message", "callback_query", "channel_post"]
+    })
+    return jsonify(result)t_cleanup = threading.Thread(target=ram_cleanup_loop, daemon=True)
 t_cleanup.start()
 
 t_deletion = threading.Thread(target=message_deletion_loop, daemon=True)
