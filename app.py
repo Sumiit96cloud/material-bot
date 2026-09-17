@@ -1326,7 +1326,7 @@ def setup():
     return jsonify(result)        {
             "callback_query_id": callback_id
         }
-    )
+    
 
 
 def delete_message(chat_id, message_id):
